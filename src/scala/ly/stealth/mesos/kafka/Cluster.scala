@@ -15,18 +15,25 @@
  * limitations under the License.
  */
 
- package ly.stealth.mesos.kafka
+package ly.stealth.mesos.kafka
 
 import java.util
-import scala.util.parsing.json.{JSON, JSONArray, JSONObject}
+import org.apache.mesos.Protos.FrameworkID
+
+import scala.util.parsing.json.{JSONArray, JSONObject}
 import scala.collection.JavaConversions._
 import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
 import java.util.Collections
-import java.io.{IOException, FileWriter, File}
+import java.io.{FileWriter, File}
+import org.I0Itec.zkclient.ZkClient
+import kafka.utils.ZKStringSerializer
+import org.I0Itec.zkclient.exception.ZkNodeExistsException
 
 class Cluster {
   private val brokers: util.List[Broker] = new util.concurrent.CopyOnWriteArrayList[Broker]()
+  private[kafka] var rebalancer: Rebalancer = new Rebalancer()
+  private[kafka] var frameworkId: Option[FrameworkID] = None
 
   def getBrokers:util.List[Broker] = Collections.unmodifiableList(brokers)
 
@@ -36,48 +43,19 @@ class Cluster {
     null
   }
 
-  def addBroker(broker: Broker): Unit = brokers.add(broker)
+  def addBroker(broker: Broker): Broker = {
+    brokers.add(broker)
+    broker
+  }
 
   def removeBroker(broker: Broker): Unit = brokers.remove(broker)
 
-  def fromJson(root: Map[String, Object]): Unit = {
-    if (root.contains("brokers"))
-      for (brokerNode <- root("brokers").asInstanceOf[List[Map[String, Object]]]) {
-        val broker: Broker = new Broker()
-        broker.fromJson(brokerNode)
-        brokers.add(broker)
-      }
-  }
-
-  def toJson: JSONObject = {
-    val obj = new mutable.LinkedHashMap[String, Object]()
-
-    if (!brokers.isEmpty) {
-      val brokerNodes = new ListBuffer[JSONObject]()
-      for (broker <- brokers)
-        brokerNodes.add(broker.toJson)
-      obj("brokers") = new JSONArray(brokerNodes.toList)
-    }
-
-    new JSONObject(obj.toMap)
-  }
-
-  def load(clearTasks: Boolean) {
-    if (!Cluster.stateFile.exists()) return
-
-    val json: String = scala.io.Source.fromFile(Cluster.stateFile).mkString
-    val node: Map[String, Object] = JSON.parseFull(json).getOrElse(null).asInstanceOf[Map[String, Object]]
-    if (node == null) throw new IOException("Failed to parse json")
-
-    brokers.clear()
-    fromJson(node)
-
-    if (clearTasks)
-      for (broker <- brokers) broker.task = null
-  }
+  def clear(): Unit = brokers.clear()
+  def load() = Cluster.storage.load(this)
+  def save() = Cluster.storage.save(this)
 
   def expandIds(expr: String): util.List[String] = {
-    val ids = new util.ArrayList[String]()
+    val ids = new util.TreeSet[String]()
 
     for (_part <- expr.split(",")) {
       val part = _part.trim()
@@ -106,18 +84,98 @@ class Cluster {
       }
     }
 
-    ids
+    new util.ArrayList(ids)
   }
 
-  def save() {
-    val json = "" + toJson
+  def fromJson(root: Map[String, Object]): Unit = {
+    if (root.contains("brokers")) {
+      for (brokerNode <- root("brokers").asInstanceOf[List[Map[String, Object]]]) {
+        val broker: Broker = new Broker()
+        broker.fromJson(brokerNode)
+        brokers.add(broker)
+      }
+    }
 
-    val writer  = new FileWriter(Cluster.stateFile)
-    try { writer.write(json) }
-    finally { writer.close() }
+    if (root.contains("frameworkId")) {
+      frameworkId = Some(FrameworkID.newBuilder().setValue(root("frameworkId").asInstanceOf[String]).build())
+    }
+  }
+
+  def toJson: JSONObject = {
+    val obj = new mutable.LinkedHashMap[String, Object]()
+
+    if (!brokers.isEmpty) {
+      val brokerNodes = new ListBuffer[JSONObject]()
+      for (broker <- brokers)
+        brokerNodes.add(broker.toJson)
+      obj("brokers") = new JSONArray(brokerNodes.toList)
+    }
+
+    frameworkId.map { id =>
+      obj("frameworkId") = id.getValue
+    }
+
+    new JSONObject(obj.toMap)
   }
 }
 
 object Cluster {
-  val stateFile: File = new File("kafka-mesos.json")
+  var storage: Storage = newStorage(Config.clusterStorage)
+
+  def newStorage(s: String): Storage = {
+    if (s.startsWith("file:")) return new FsStorage(new File(s.substring("file:".length)))
+    else if (s.startsWith("zk:")) return new ZkStorage(s.substring("zk:".length))
+    throw new IllegalStateException("Unsupported storage " + s)
+  }
+
+  abstract class Storage {
+    def load(cluster: Cluster): Unit = {
+      val json: String = loadJson
+      if (json == null) return
+      
+      val node: Map[String, Object] = Util.parseJson(json)
+      cluster.brokers.clear()
+      cluster.fromJson(node)
+    }
+    
+    def save(cluster: Cluster): Unit = {
+      saveJson("" + cluster.toJson)
+    }
+    
+    protected def loadJson: String
+    protected def saveJson(json: String): Unit
+  }
+
+  class FsStorage(val file: File) extends Storage {
+    protected def loadJson: String = {
+      if (!file.exists) null else scala.io.Source.fromFile(file).mkString
+    }
+
+    protected def saveJson(json: String): Unit = {
+      val writer  = new FileWriter(file)
+      try { writer.write(json) }
+      finally { writer.close() }
+    }
+  }
+
+  object FsStorage {
+    val DEFAULT_FILE: File = new File("kafka-mesos.json")
+  }
+
+  class ZkStorage(val path: String) extends Storage {
+    def zkClient: ZkClient = new ZkClient(Config.kafkaZkConnect, 30000, 30000, ZKStringSerializer)
+
+    protected def loadJson: String = {
+      val zkClient = this.zkClient
+      try { zkClient.readData(path, true).asInstanceOf[String] }
+      finally { zkClient.close() }
+    }
+
+    protected def saveJson(json: String): Unit = {
+      val zkClient = this.zkClient
+      try { zkClient.createPersistent(path, json) }
+      catch { case e: ZkNodeExistsException => zkClient.writeData(path, json) }
+      finally { zkClient.close() }
+    }
+  }
 }
