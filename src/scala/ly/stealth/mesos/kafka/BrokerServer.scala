@@ -15,26 +15,32 @@
  * limitations under the License.
  */
 
- package ly.stealth.mesos.kafka
+package ly.stealth.mesos.kafka
 
 import org.apache.log4j.Logger
 import java.io.{FileInputStream, File}
 import java.net.{URL, URLClassLoader}
 import java.util.Properties
 import java.util
+import scala.collection.JavaConversions._
 
-class KafkaServer(_id: String, props: Map[String, String]) {
+abstract class BrokerServer {
+  def isStarted: Boolean
+  def start(props: util.Map[String, String] = new util.HashMap()): Unit
+  def stop(): Unit
+  def waitFor(): Unit
+}
+
+class KafkaServer extends BrokerServer {
   val logger = Logger.getLogger(classOf[KafkaServer])
-
-  var id: String = _id
-  var server: Object = null
+  @volatile var server: Object = null
 
   def isStarted: Boolean = server != null
 
-  def start(): Unit = {
+  def start(props: util.Map[String, String]): Unit = {
     if (isStarted) throw new IllegalStateException("started")
 
-    server = Distro.newServer(props)
+    server = BrokerServer.Distro.newServer(props)
 
     logger.info("Starting KafkaServer")
     server.getClass.getMethod("startup").invoke(server)
@@ -45,21 +51,24 @@ class KafkaServer(_id: String, props: Map[String, String]) {
 
     logger.info("Stopping KafkaServer")
     server.getClass.getMethod("shutdown").invoke(server)
-    waitFor()
 
+    waitFor()
     server = null
   }
 
   def waitFor(): Unit = {
-    server.getClass.getMethod("awaitShutdown").invoke(server)
+    if (server != null)
+      server.getClass.getMethod("awaitShutdown").invoke(server)
   }
+}
 
+object BrokerServer {
   object Distro {
     var dir: File = null
     var loader: URLClassLoader = null
     init()
 
-    def newServer(props: Map[String, String]): Object = {
+    def newServer(props: util.Map[String, String]): Object = {
       val p: Properties = new Properties()
       val stream: FileInputStream = new FileInputStream(dir + "/config/server.properties")
       try { p.load(stream) }

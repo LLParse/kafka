@@ -22,23 +22,18 @@ import org.apache.mesos.Protos._
 import org.apache.mesos.{MesosSchedulerDriver, SchedulerDriver}
 import java.util
 import com.google.protobuf.ByteString
-import java.util.Properties
-import java.io.StringWriter
+import java.util.{Collections, Date}
 import scala.collection.JavaConversions._
+import Util.Str
 
 object Scheduler extends org.apache.mesos.Scheduler {
   private val logger: Logger = Logger.getLogger(this.getClass)
 
-  private val cluster: Cluster = new Cluster()
-  cluster.load(clearTasks = true)
-
+  val cluster: Cluster = new Cluster()
   private var driver: SchedulerDriver = null
-  private val taskIds: util.List[String] = new util.concurrent.CopyOnWriteArrayList[String]()
 
-  def getCluster: Cluster = cluster
-
-  private def executor(broker: Broker): ExecutorInfo = {
-    var cmd = "java -cp " + HttpServer.jarName
+  private[kafka] def newExecutor(broker: Broker): ExecutorInfo = {
+    var cmd = "java -cp " + HttpServer.jar.getName
     cmd += " -Xmx" + broker.heap + "m"
 
     if (Config.debug) cmd += " -Ddebug"
@@ -48,29 +43,37 @@ object Scheduler extends org.apache.mesos.Scheduler {
       .setExecutorId(ExecutorID.newBuilder.setValue(Broker.nextExecutorId(broker)))
       .setCommand(
         CommandInfo.newBuilder
-          .addUris(CommandInfo.URI.newBuilder().setValue(Config.schedulerUrl + "/executor/" + HttpServer.jarName))
-          .addUris(CommandInfo.URI.newBuilder().setValue(Config.schedulerUrl + "/kafka/" + HttpServer.kafkaDistName))
+          .addUris(CommandInfo.URI.newBuilder().setValue(Config.schedulerUrl + "/executor/" + HttpServer.jar.getName))
+          .addUris(CommandInfo.URI.newBuilder().setValue(Config.schedulerUrl + "/kafka/" + HttpServer.kafkaDist.getName))
           .setValue(cmd)
       )
       .setName("BrokerExecutor")
       .build()
   }
 
-  private def task(broker: Broker, offer: Offer): TaskInfo = {
+  private[kafka] def newTask(broker: Broker, offer: Offer): TaskInfo = {
     val port = findBrokerPort(offer)
 
-    val props: Map[String, String] = Map(
-      "broker.id" -> broker.id,
-      "port" -> ("" + port),
-      "zookeeper.connect" -> Config.kafkaZkConnect
-    )
+    def taskData: ByteString = {
+      val defaults: Map[String, String] = Map(
+        "broker.id" -> broker.id,
+        "port" -> ("" + port),
+        "log.dirs" -> "kafka-logs",
+
+        "zookeeper.connect" -> Config.kafkaZkConnect,
+        "host.name" -> offer.getHostname
+      )
+
+      val options = Util.formatMap(broker.options(defaults))
+      ByteString.copyFromUtf8(options)
+    }
 
     val taskBuilder: TaskInfo.Builder = TaskInfo.newBuilder
       .setName("BrokerTask")
       .setTaskId(TaskID.newBuilder.setValue(Broker.nextTaskId(broker)).build)
       .setSlaveId(offer.getSlaveId)
-      .setData(taskData(broker, props))
-      .setExecutor(executor(broker))
+      .setData(taskData)
+      .setExecutor(newExecutor(broker))
 
     taskBuilder
       .addResources(Resource.newBuilder.setName("cpus").setType(Value.Type.SCALAR).setScalar(Value.Scalar.newBuilder.setValue(broker.cpus)))
@@ -83,26 +86,83 @@ object Scheduler extends org.apache.mesos.Scheduler {
   }
 
   def registered(driver: SchedulerDriver, id: FrameworkID, master: MasterInfo): Unit = {
-    logger.info("[registered] framework:" + MesosStr.id(id.getValue) + " master:" + MesosStr.master(master))
+    logger.info("[registered] framework:" + Str.id(id.getValue) + " master:" + Str.master(master))
+    cluster.frameworkId = Some(id)
+    cluster.save()
     this.driver = driver
+    reconcileTasks()
   }
 
   def reregistered(driver: SchedulerDriver, master: MasterInfo): Unit = {
-    logger.info("[reregistered] master:" + MesosStr.master(master))
+    logger.info("[reregistered] master:" + Str.master(master))
     this.driver = driver
+    reconcileTasks()
   }
 
   def resourceOffers(driver: SchedulerDriver, offers: util.List[Offer]): Unit = {
-    logger.info("[resourceOffers]\n" + MesosStr.offers(offers))
-    syncClusterState(offers)
+    logger.info("[resourceOffers]\n" + Str.offers(offers))
+    syncBrokers(offers)
   }
 
   def offerRescinded(driver: SchedulerDriver, id: OfferID): Unit = {
-    logger.info("[offerRescinded] " + MesosStr.id(id.getValue))
+    logger.info("[offerRescinded] " + Str.id(id.getValue))
   }
 
   def statusUpdate(driver: SchedulerDriver, status: TaskStatus): Unit = {
-    logger.info("[statusUpdate] " + MesosStr.taskStatus(status))
+    logger.info("[statusUpdate] " + Str.taskStatus(status))
+    onBrokerStatus(status)
+  }
+
+  def frameworkMessage(driver: SchedulerDriver, executorId: ExecutorID, slaveId: SlaveID, data: Array[Byte]): Unit = {
+    logger.info("[frameworkMessage] executor:" + Str.id(executorId.getValue) + " slave:" + Str.id(slaveId.getValue) + " data: " + new String(data))
+  }
+
+  def disconnected(driver: SchedulerDriver): Unit = {
+    logger.info("[disconnected]")
+    this.driver = null
+  }
+
+  def slaveLost(driver: SchedulerDriver, id: SlaveID): Unit = {
+    logger.info("[slaveLost] " + Str.id(id.getValue))
+  }
+
+  def executorLost(driver: SchedulerDriver, executorId: ExecutorID, slaveId: SlaveID, status: Int): Unit = {
+    logger.info("[executorLost] executor:" + Str.id(executorId.getValue) + " slave:" + Str.id(slaveId.getValue) + " status:" + status)
+  }
+
+  def error(driver: SchedulerDriver, message: String): Unit = {
+    logger.info("[error] " + message)
+  }
+
+  private[kafka] def syncBrokers(offers: util.List[Offer]): Unit = {
+    def startBroker(offer: Offer): Boolean = {
+      for (broker <- cluster.getBrokers) {
+        if (broker.shouldStart(offer, otherTasksAttributes)) {
+          launchTask(broker, offer)
+          return true
+        }
+      }
+
+      false
+    }
+
+    for (offer <- offers) {
+      val started = startBroker(offer)
+      if (!started) driver.declineOffer(offer.getId)
+    }
+
+    for (broker <- cluster.getBrokers) {
+      if (broker.shouldStop) {
+        logger.info(s"Stopping broker ${broker.id}: killing task ${broker.task.id}")
+        driver.killTask(TaskID.newBuilder.setValue(broker.task.id).build)
+        broker.task.state = Broker.State.STOPPING
+      }
+    }
+
+    cluster.save()
+  }
+
+  private[kafka] def onBrokerStatus(status: TaskStatus): Unit = {
     val broker = cluster.getBroker(Broker.idFromTaskId(status.getTaskId.getValue))
 
     status.getState match {
@@ -115,53 +175,27 @@ object Scheduler extends org.apache.mesos.Scheduler {
       case _ => logger.warn("Got unexpected task state: " + status.getState)
     }
 
-    syncClusterState()
+    cluster.save()
   }
 
-  def frameworkMessage(driver: SchedulerDriver, executorId: ExecutorID, slaveId: SlaveID, data: Array[Byte]): Unit = {
-    logger.info("[frameworkMessage] executor:" + MesosStr.id(executorId.getValue) + " slave:" + MesosStr.id(slaveId.getValue) + " data: " + new String(data))
-  }
-
-  def disconnected(driver: SchedulerDriver): Unit = {
-    logger.info("[disconnected]")
-    this.driver = null
-  }
-
-  def slaveLost(driver: SchedulerDriver, id: SlaveID): Unit = {
-    logger.info("[slaveLost] " + MesosStr.id(id.getValue))
-  }
-
-  def executorLost(driver: SchedulerDriver, executorId: ExecutorID, slaveId: SlaveID, status: Int): Unit = {
-    logger.info("[executorLost] executor:" + MesosStr.id(executorId.getValue) + " slave:" + MesosStr.id(slaveId.getValue) + " status:" + status)
-  }
-
-  def error(driver: SchedulerDriver, message: String): Unit = {
-    logger.info("[error] " + message)
-  }
-
-  private def onBrokerStarted(broker: Broker, status: TaskStatus): Unit = {
-    if (broker == null) return
-
-    if (broker.task != null) broker.task.running = true
+  private[kafka] def onBrokerStarted(broker: Broker, status: TaskStatus): Unit = {
+    broker.task.state = Broker.State.RUNNING
     broker.failover.resetFailures()
   }
 
-  private def onBrokerStopped(broker: Broker, status: TaskStatus): Unit = {
-    taskIds.remove(status.getTaskId.getValue)
-    if (broker == null) return
-
+  private[kafka] def onBrokerStopped(broker: Broker, status: TaskStatus, now: Date = new Date()): Unit = {
     broker.task = null
-    val failed = status.getState != TaskState.TASK_FINISHED && status.getState != TaskState.TASK_KILLED
+    val failed = broker.active && status.getState != TaskState.TASK_FINISHED && status.getState != TaskState.TASK_KILLED
 
     if (failed) {
-      broker.failover.registerFailure()
+      broker.failover.registerFailure(now)
 
-      var msg = "Broker " + broker.id + " failed to start " + broker.failover.failures
+      var msg = s"Broker ${broker.id} failed ${broker.failover.failures}"
       if (broker.failover.maxTries != null) msg += "/" + broker.failover.maxTries
 
       if (!broker.failover.isMaxTriesExceeded) {
         msg += ", waiting " + broker.failover.currentDelay
-        msg += ", next start ~ " + MesosStr.dateTime(broker.failover.delayExpires)
+        msg += ", next start ~ " + Str.dateTime(broker.failover.delayExpires)
       } else {
         broker.active = false
         msg += ", failure limit exceeded"
@@ -172,82 +206,87 @@ object Scheduler extends org.apache.mesos.Scheduler {
     }
   }
 
-  def syncClusterState(offers: util.List[Offer] = new util.ArrayList[Offer]()): Unit = {
-    logger.debug("[syncClusterState]")
+  private def onShutdown() {
+    cluster.getBrokers.foreach(_.task = null)
     cluster.save()
-    if (driver == null) return
-
-    for (offer <- offers) {
-      var accepted = false
-
-      for (broker <- cluster.getBrokers) {
-        val acceptable = !accepted && broker.active &&
-          broker.matches(offer) && !broker.failover.isWaitingDelay
-
-        if (broker.task == null && acceptable) {
-          accepted = true
-          launchTask(broker, offer)
-        }
-      }
-
-      if (!accepted)
-        driver.declineOffer(offer.getId)
-    }
-
-    for (id <- taskIds) {
-      val broker = cluster.getBroker(Broker.idFromTaskId(id))
-      if (broker == null || !broker.active) {
-        logger.info("Killing task " + id)
-        driver.killTask(TaskID.newBuilder.setValue(id).build)
-      }
-    }
   }
 
-  def launchTask(broker: Broker, offer: Offer): Unit = {
-    val task_ = task(broker, offer)
+  private[kafka] def launchTask(broker: Broker, offer: Offer): Unit = {
+    val task_ = newTask(broker, offer)
     val id = task_.getTaskId.getValue
 
-    driver.launchTasks(util.Arrays.asList(offer.getId), util.Arrays.asList(task_))
-    broker.task = new Broker.Task(id, offer.getHostname, findBrokerPort(offer))
-    taskIds.add(id)
+    val attributes = new util.LinkedHashMap[String, String]()
+    for (attribute <- offer.getAttributesList)
+      if (attribute.hasText) attributes.put(attribute.getName, attribute.getText.getValue)
 
-    logger.info("Launching task " + id + " by offer " + MesosStr.id(offer.getId.getValue) + "\n" + MesosStr.task(task_))
+    driver.launchTasks(util.Arrays.asList(offer.getId), util.Arrays.asList(task_))
+    broker.task = new Broker.Task(id, task_.getSlaveId.getValue, task_.getExecutor.getExecutorId.getValue, offer.getHostname, findBrokerPort(offer), attributes)
+
+    logger.info(s"Starting broker ${broker.id}: launching task $id by offer ${Str.id(offer.getId.getValue)}\n ${Str.task(task_)}")
   }
 
-  private def findBrokerPort(offer: Offer): Int = {
+  def forciblyStopBroker(broker: Broker): Unit = {
+    if (driver != null && broker.task != null) {
+      logger.info(s"Stopping broker ${broker.id} forcibly: sending 'stop' message")
+
+      driver.sendFrameworkMessage(
+        ExecutorID.newBuilder().setValue(broker.task.executorId).build(),
+        SlaveID.newBuilder().setValue(broker.task.slaveId).build(),
+        "stop".getBytes
+      )
+    }
+  }
+
+  private[kafka] def reconcileTasks(): Unit = {
+    for (broker <- cluster.getBrokers)
+      if (broker.task != null) {
+        logger.info(s"Reconciling state of broker ${broker.id}, task ${broker.task.id}")
+        broker.task.state = Broker.State.RECONCILING
+      }
+
+    driver.reconcileTasks(Collections.emptyList())
+  }
+
+  private[kafka] def otherTasksAttributes(name: String): Array[String] = {
+    def value(task: Broker.Task, name: String): String = {
+      if (name == "hostname") return task.hostname
+      task.attributes.get(name)
+    }
+
+    val values = new util.ArrayList[String]()
+    for (broker <- cluster.getBrokers)
+      if (broker.task != null) {
+        val v = value(broker.task, name)
+        if (v != null) values.add(v)
+      }
+
+    values.toArray(Array[String]())
+  }
+
+  private[kafka] def findBrokerPort(offer: Offer): Int = {
     for (resource <- offer.getResourcesList) {
       if (resource.getName == "ports") {
         val ranges: util.List[Value.Range] = resource.getRanges.getRangeList
         val range = if (ranges.isEmpty) null else ranges.get(0)
 
-        if (range == null || !range.hasBegin) throw new IllegalStateException("Invalid port range in offer " + MesosStr.offer(offer))
+        assert(range.hasBegin)
+        if (range == null) throw new IllegalArgumentException("Invalid port range in offer " + Str.offer(offer))
         return range.getBegin.toInt
       }
     }
 
-    throw new IllegalStateException("No port range in offer " + MesosStr.offer(offer))
-  }
-
-  private def taskData(broker: Broker, props: Map[String, String]): ByteString = {
-    val p: Properties = new Properties()
-    for ((k, v) <- broker.effectiveOptionMap) p.setProperty(k, v)
-    for ((k, v) <- props) p.setProperty(k, v)
-
-    if (!p.containsKey("log.dirs"))
-      p.setProperty("log.dirs", "kafka-logs")
-
-    val buffer: StringWriter = new StringWriter()
-    p.store(buffer, "")
-
-    ByteString.copyFromUtf8("" + buffer)
+    throw new IllegalArgumentException("No port range in offer " + Str.offer(offer))
   }
 
   def main(args: Array[String]) {
     initLogging()
+    cluster.load()
+
     HttpServer.start()
 
     val frameworkBuilder = FrameworkInfo.newBuilder()
     frameworkBuilder.setUser(Config.mesosUser)
+    cluster.frameworkId.map(fwId => frameworkBuilder.setId(fwId))
     frameworkBuilder.setName("Kafka Mesos")
     frameworkBuilder.setFailoverTimeout(Config.failoverTimeout)
     frameworkBuilder.setCheckpoint(true)
@@ -256,7 +295,10 @@ object Scheduler extends org.apache.mesos.Scheduler {
 
     Runtime.getRuntime.addShutdownHook(new Thread() {
       override def run() = {
-        if (driver != null) driver.stop()
+        if (driver != null) {
+          driver.stop()
+          Scheduler.onShutdown()
+        }
         HttpServer.stop()
       }
     })
@@ -265,18 +307,64 @@ object Scheduler extends org.apache.mesos.Scheduler {
     System.exit(status)
   }
 
-  def initLogging() {
+  private def initLogging() {
+    System.setProperty("org.eclipse.jetty.util.log.class", classOf[JettyLog4jLogger].getName)
     BasicConfigurator.resetConfiguration()
 
     val root = Logger.getRootLogger
     root.setLevel(Level.INFO)
 
-    Logger.getLogger("org.apache.zookeeper.ZooKeeper").setLevel(Level.WARN)
+    Logger.getLogger("org.apache.zookeeper").setLevel(Level.WARN)
+    Logger.getLogger("org.I0Itec.zkclient").setLevel(Level.WARN)
 
     val logger = Logger.getLogger(Scheduler.getClass)
     logger.setLevel(if (Config.debug) Level.DEBUG else Level.INFO)
 
     val layout = new PatternLayout("%d [%t] %-5p %c %x - %m%n")
     root.addAppender(new ConsoleAppender(layout))
+  }
+
+  class JettyLog4jLogger extends org.eclipse.jetty.util.log.Logger {
+    private var logger: Logger = Logger.getLogger("Jetty")
+
+    def this(logger: Logger) {
+      this()
+      this.logger = logger
+    }
+
+    def isDebugEnabled: Boolean = logger.isDebugEnabled
+    def setDebugEnabled(enabled: Boolean) = logger.setLevel(if (enabled) Level.DEBUG else Level.INFO)
+
+    def getName: String = logger.getName
+    def getLogger(name: String): org.eclipse.jetty.util.log.Logger = new JettyLog4jLogger(Logger.getLogger(name))
+
+    def info(s: String, args: AnyRef*) = logger.info(format(s, args))
+    def info(s: String, t: Throwable) = logger.info(s, t)
+    def info(t: Throwable) = logger.info("", t)
+
+    def debug(s: String, args: AnyRef*) = logger.debug(format(s, args))
+    def debug(s: String, t: Throwable) = logger.debug(s, t)
+
+    def debug(t: Throwable) = logger.debug("", t)
+    def warn(s: String, args: AnyRef*) = logger.warn(format(s, args))
+
+    def warn(s: String, t: Throwable) = logger.warn(s, t)
+    def warn(s: String) = logger.warn(s)
+    def warn(t: Throwable) = logger.warn("", t)
+
+    def ignore(t: Throwable) = logger.info("Ignored", t)
+  }
+
+  private def format(s: String, args: AnyRef*): String = {
+    var result: String = ""
+    var i: Int = 0
+
+    for (token <- s.split("\\{\\}")) {
+      result += token
+      if (args.length > i) result += args(i)
+      i += 1
+    }
+
+    result
   }
 }

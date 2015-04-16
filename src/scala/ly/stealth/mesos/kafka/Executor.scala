@@ -15,25 +15,24 @@
  * limitations under the License.
  */
 
- package ly.stealth.mesos.kafka
+package ly.stealth.mesos.kafka
 
 import org.apache.mesos.{ExecutorDriver, MesosExecutorDriver}
 import org.apache.mesos.Protos._
 import java.io._
-import java.util
-import scala.collection.immutable.HashMap
 import org.apache.log4j._
+import Util.Str
 
 object Executor extends org.apache.mesos.Executor {
   val logger: Logger = Logger.getLogger(Executor.getClass)
-  @volatile var server: KafkaServer = null
+  var server: BrokerServer = new KafkaServer()
 
   def registered(driver: ExecutorDriver, executor: ExecutorInfo, framework: FrameworkInfo, slave: SlaveInfo): Unit = {
-    logger.info("[registered] framework:" + MesosStr.framework(framework) + " slave:" + MesosStr.slave(slave))
+    logger.info("[registered] framework:" + Str.framework(framework) + " slave:" + Str.slave(slave))
   }
 
   def reregistered(driver: ExecutorDriver, slave: SlaveInfo): Unit = {
-    logger.info("[reregistered] " + MesosStr.slave(slave))
+    logger.info("[reregistered] " + Str.slave(slave))
   }
 
   def disconnected(driver: ExecutorDriver): Unit = {
@@ -41,55 +40,76 @@ object Executor extends org.apache.mesos.Executor {
   }
 
   def launchTask(driver: ExecutorDriver, task: TaskInfo): Unit = {
-    logger.info("[launchTask] " + MesosStr.task(task))
-
-    new Thread {
-      override def run() {
-        setName("KafkaServer")
-        runKafkaServer(driver, task)
-      }
-    }.start()
+    logger.info("[launchTask] " + Str.task(task))
+    startBroker(driver, task)
   }
 
   def killTask(driver: ExecutorDriver, id: TaskID): Unit = {
     logger.info("[killTask] " + id.getValue)
-    if (server != null) server.stop()
+    stopExecutor(driver, async = true)
   }
 
   def frameworkMessage(driver: ExecutorDriver, data: Array[Byte]): Unit = {
     logger.info("[frameworkMessage] " + new String(data))
+    handleMessage(driver, new String(data))
   }
 
   def shutdown(driver: ExecutorDriver): Unit = {
     logger.info("[shutdown]")
-    if (server != null) server.stop()
+    stopExecutor(driver)
   }
 
   def error(driver: ExecutorDriver, message: String): Unit = {
     logger.info("[error] " + message)
   }
 
-  private def runKafkaServer(driver: ExecutorDriver, task: TaskInfo): Unit = {
-    try {
-      server = new KafkaServer(task.getTaskId.getValue, props(task))
-      server.start()
+  private[kafka] def startBroker(driver: ExecutorDriver, task: TaskInfo): Unit = {
+    def runBroker0 {
+      try {
+        server.start(Util.parseMap(task.getData.toStringUtf8))
 
-      var status = TaskStatus.newBuilder.setTaskId(task.getTaskId).setState(TaskState.TASK_RUNNING).build
-      driver.sendStatusUpdate(status)
+        var status = TaskStatus.newBuilder.setTaskId(task.getTaskId).setState(TaskState.TASK_RUNNING).build
+        driver.sendStatusUpdate(status)
 
-      server.waitFor()
-      status = TaskStatus.newBuilder.setTaskId(task.getTaskId).setState(TaskState.TASK_FINISHED).build
-      driver.sendStatusUpdate(status)
-    } catch {
-      case t: Throwable =>
-        logger.warn("", t)
-        sendTaskFailed(driver, task, t)
-    } finally {
-      if (server != null) {
-        server.stop()
-        server = null
+        server.waitFor()
+        status = TaskStatus.newBuilder.setTaskId(task.getTaskId).setState(TaskState.TASK_FINISHED).build
+        driver.sendStatusUpdate(status)
+      } catch {
+        case t: Throwable =>
+          logger.warn("", t)
+          sendTaskFailed(driver, task, t)
+      } finally {
+        stopExecutor(driver)
       }
     }
+
+    new Thread {
+      override def run() {
+        setName("BrokerServer")
+        runBroker0
+      }
+    }.start()
+  }
+
+  private[kafka] def stopExecutor(driver: ExecutorDriver, async: Boolean = false): Unit = {
+    def stop0 {
+      if (server.isStarted) server.stop()
+      driver.stop()
+    }
+
+    if (async)
+      new Thread() {
+        override def run(): Unit = {
+          setName("ExecutorStopper")
+          stop0
+        }
+      }.start()
+    else
+      stop0
+  }
+
+  private[kafka] def handleMessage(driver: ExecutorDriver, message: String): Unit = {
+    if (message == "stop") driver.stop()
   }
 
   private def sendTaskFailed(driver: ExecutorDriver, task: TaskInfo, t: Throwable) {
@@ -101,20 +121,6 @@ object Executor extends org.apache.mesos.Executor {
       .setMessage("" + stackTrace)
       .build
     )
-  }
-
-  private def props(taskInfo: TaskInfo): Map[String, String] = {
-    val buffer = new StringReader(taskInfo.getData.toStringUtf8)
-
-    val p: util.Properties = new util.Properties()
-    p.load(buffer)
-
-    import scala.collection.JavaConversions._
-    var props = new HashMap[String, String]()
-    for (k <- p.keySet())
-      props += ("" + k -> p.getProperty("" + k))
-
-    props
   }
 
   def main(args: Array[String]) {

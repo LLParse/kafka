@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
- package ly.stealth.mesos.kafka
+package ly.stealth.mesos.kafka
 
 import java.io._
 import org.apache.log4j.Logger
@@ -27,19 +27,19 @@ import java.util
 import scala.collection.JavaConversions._
 import scala.util.parsing.json.{JSONArray, JSONObject}
 import scala.collection.mutable.ListBuffer
+import ly.stealth.mesos.kafka.Util.Period
+import ly.stealth.mesos.kafka.Broker.State
 
 object HttpServer {
-  val jarPath = findJar()
-  def jarName = new File(jarPath).getName
-
-  val kafkaDistPath = findKafkaDist()
-  def kafkaDistName = new File(kafkaDistPath).getName
+  var jar: File = null
+  var kafkaDist: File = null
 
   val logger = Logger.getLogger(HttpServer.getClass)
   var server: Server = null
 
-  def start() {
+  def start(resolveDeps: Boolean = true) {
     if (server != null) throw new IllegalStateException("started")
+    if (resolveDeps) this.resolveDeps
 
     val threadPool = new QueuedThreadPool(16)
     threadPool.setName("Jetty")
@@ -68,47 +68,41 @@ object HttpServer {
     logger.info("stopped")
   }
 
-  private def findJar(): String = {
+  private def resolveDeps: Unit = {
     val jarMask: String = "kafka-mesos.*\\.jar"
-
-    for (file <- new File(".").listFiles()) {
-      if (file.getName.matches(jarMask))
-        return file.getPath
-    }
-
-    val classpath = System.getProperty("java.class.path")
-    for (path <- classpath.split(File.pathSeparator)) {
-      if (path.matches(jarMask))
-        return path
-    }
-
-    throw new IllegalStateException(jarMask + " not found in current dir and on classpath")
-  }
-
-  private def findKafkaDist(): String = {
     val kafkaMask: String = "kafka.*\\.tgz"
 
-    for (file <- new File(jarPath).getParentFile.listFiles()) {
-      if (file.getName.matches(kafkaMask))
-        return file.getPath
+    for (file <- new File(".").listFiles()) {
+      if (file.getName.matches(jarMask)) jar = file
+      if (file.getName.matches(kafkaMask)) kafkaDist = file
     }
 
-    throw new IllegalStateException(kafkaMask + " not found in " + new File(jarPath).getParentFile)
+    if (jar == null) throw new IllegalStateException(jarMask + " not found in current dir")
+    if (kafkaDist == null) throw new IllegalStateException(kafkaMask + " not found in in current dir")
   }
 
-  class Servlet extends HttpServlet {
+  private class Servlet extends HttpServlet {
     override def doGet(request: HttpServletRequest, response: HttpServletResponse): Unit = {
+      try { handle(request, response) }
+      catch {
+        case e: Exception =>
+          response.sendError(500, "" + e) // specify error message
+          throw e
+      }
+    }
+
+    def handle(request: HttpServletRequest, response: HttpServletResponse): Unit = {
       val uri = request.getRequestURI
-      if (uri.startsWith("/executor/")) downloadFile(HttpServer.jarPath, response)
-      else if (uri.startsWith("/kafka/")) downloadFile(HttpServer.kafkaDistPath, response)
+      if (uri.startsWith("/executor/")) downloadFile(HttpServer.jar, response)
+      else if (uri.startsWith("/kafka/")) downloadFile(HttpServer.kafkaDist, response)
       else if (uri.startsWith("/api/brokers")) handleBrokersApi(request, response)
       else response.sendError(404)
     }
 
-    def downloadFile(path: String, response: HttpServletResponse): Unit = {
+    def downloadFile(file: File, response: HttpServletResponse): Unit = {
       response.setContentType("application/zip")
-      response.setHeader("Content-Disposition", "attachment; filename=\"" + new File(path).getName + "\"")
-      copyAndClose(new FileInputStream(path), response.getOutputStream)
+      response.setHeader("Content-Disposition", "attachment; filename=\"" + file.getName + "\"")
+      Util.copyAndClose(new FileInputStream(file), response.getOutputStream)
     }
 
     def handleBrokersApi(request: HttpServletRequest, response: HttpServletResponse): Unit = {
@@ -116,26 +110,25 @@ object HttpServer {
       var uri: String = request.getRequestURI.substring("/api/brokers".length)
       if (uri.startsWith("/")) uri = uri.substring(1)
 
-      if (uri == "status") handleGetBrokers(response)
+      if (uri == "status") handleStatus(response)
       else if (uri == "add" || uri == "update") handleAddUpdateBroker(request, response)
       else if (uri == "remove") handleRemoveBroker(request, response)
       else if (uri == "start" || uri == "stop") handleStartStopBroker(request, response)
+      else if (uri == "rebalance") handleRebalance(request, response)
       else response.sendError(404)
     }
 
-    def handleGetBrokers(response: HttpServletResponse): Unit = {
-      response.getWriter.println("" + Scheduler.getCluster.toJson)
+    def handleStatus(response: HttpServletResponse): Unit = {
+      response.getWriter.println("" + Scheduler.cluster.toJson)
     }
 
     def handleAddUpdateBroker(request: HttpServletRequest, response: HttpServletResponse): Unit = {
-      val cluster = Scheduler.getCluster
+      val cluster = Scheduler.cluster
       val add: Boolean = request.getRequestURI.endsWith("add")
       val errors = new util.ArrayList[String]()
 
       val idExpr: String = request.getParameter("id")
       if (idExpr == null || idExpr.isEmpty) errors.add("id required")
-
-      val host: String = request.getParameter("host")
 
       var cpus: java.lang.Double = null
       if (request.getParameter("cpus") != null)
@@ -153,15 +146,15 @@ object HttpServer {
         catch { case e: NumberFormatException => errors.add("Invalid heap") }
 
 
-      val options: String = request.getParameter("options")
-      if (options != null)
-        try { Broker.parseMap(request.getParameter("options"), ";", "=") }
-        catch { case e: IllegalArgumentException => errors.add("Invalid options") }
+      var options: util.Map[String, String] = null
+      if (request.getParameter("options") != null)
+        try { options = Util.parseMap(request.getParameter("options"), nullValues = false) }
+        catch { case e: IllegalArgumentException => errors.add("Invalid options: " + e.getMessage) }
 
-      val attributes: String = request.getParameter("attributes")
-      if (attributes != null)
-        try { Broker.parseMap(request.getParameter("attributes"), ";", ":") }
-        catch { case e: IllegalArgumentException => errors.add("Invalid attributes") }
+      var constraints: util.Map[String, Constraint] = null
+      if (request.getParameter("constraints") != null)
+        try { constraints = Util.parseMap(request.getParameter("constraints"), nullValues = false).mapValues(new Constraint(_)).view.force }
+        catch { case e: IllegalArgumentException => errors.add("Invalid constraints: " + e.getMessage) }
 
 
       var failoverDelay: Period = null
@@ -184,7 +177,7 @@ object HttpServer {
 
       var ids: util.List[String] = null
       try { ids = cluster.expandIds(idExpr) }
-      catch { case e: IllegalArgumentException => response.sendError(400, "invalid id-expression"); return }
+      catch { case e: IllegalArgumentException => response.sendError(400, "invalid id-expr"); return }
 
       val brokers = new util.ArrayList[Broker]()
 
@@ -204,13 +197,12 @@ object HttpServer {
       if (!errors.isEmpty) { response.sendError(400, errors.mkString("; ")); return }
 
       for (broker <- brokers) {
-        if (host != null) broker.host = if (host != "") host else null
         if (cpus != null) broker.cpus = cpus
         if (mem != null) broker.mem = mem
         if (heap != null) broker.heap = heap
 
-        if (options != null) broker.options = if (options != "") options else null
-        if (attributes != null) broker.attributes = if (attributes != "") attributes else null
+        if (options != null) broker.options = options
+        if (constraints != null) broker.constraints = constraints
 
         if (failoverDelay != null) broker.failover.delay = failoverDelay
         if (failoverMaxDelay != null) broker.failover.maxDelay = failoverMaxDelay
@@ -227,18 +219,18 @@ object HttpServer {
     }
 
     def handleRemoveBroker(request: HttpServletRequest, response: HttpServletResponse): Unit = {
-      val cluster = Scheduler.getCluster
+      val cluster = Scheduler.cluster
 
       val idExpr = request.getParameter("id")
       if (idExpr == null) { response.sendError(400, "id required"); return }
 
       var ids: util.List[String] = null
       try { ids = cluster.expandIds(idExpr) }
-      catch { case e: IllegalArgumentException => response.sendError(400, "invalid id-expression"); return }
+      catch { case e: IllegalArgumentException => response.sendError(400, "invalid id-expr"); return }
 
       val brokers = new util.ArrayList[Broker]()
       for (id <- ids) {
-        val broker = Scheduler.getCluster.getBroker(id)
+        val broker = Scheduler.cluster.getBroker(id)
         if (broker == null) { response.sendError(400, s"broker $id not found"); return }
         if (broker.active) { response.sendError(400, s"broker $id is active"); return }
         brokers.add(broker)
@@ -254,65 +246,107 @@ object HttpServer {
     }
 
     def handleStartStopBroker(request: HttpServletRequest, response: HttpServletResponse): Unit = {
-      val cluster: Cluster = Scheduler.getCluster
+      val cluster: Cluster = Scheduler.cluster
       val start: Boolean = request.getRequestURI.endsWith("start")
-      
-      var timeout: Long = 30 * 1000
-      try { timeout = java.lang.Long.parseLong(request.getParameter("timeout")) }
-      catch { case ignore: NumberFormatException => }
-      
+
+      var timeout: Period = new Period("60s")
+      if (request.getParameter("timeout") != null)
+        try { timeout = new Period(request.getParameter("timeout")) }
+        catch { case ignore: IllegalArgumentException => response.sendError(400, "invalid timeout"); return }
+
+      val force: Boolean = request.getParameter("force") != null
+
       val idExpr: String = request.getParameter("id")
       if (idExpr == null) { response.sendError(400, "id required"); return }
 
       var ids: util.List[String] = null
       try { ids = cluster.expandIds(idExpr) }
-      catch { case e: IllegalArgumentException => response.sendError(400, "invalid id-expression"); return }
+      catch { case e: IllegalArgumentException => response.sendError(400, "invalid id-expr"); return }
 
       val brokers = new util.ArrayList[Broker]()
       for (id <- ids) {
         val broker = cluster.getBroker(id)
         if (broker == null) { response.sendError(400, "broker " + id + " not found"); return }
-        if (broker.active == start) { response.sendError(400, "broker " + id + " is" + (if (start) "" else " not") +  " active"); return }
+        if (!force && broker.active == start) { response.sendError(400, "broker " + id + " is" + (if (start) "" else " not") +  " active"); return }
         brokers.add(broker)
       }
 
       for (broker <- brokers) {
         broker.active = start
         broker.failover.resetFailures()
+        if (!start && force) Scheduler.forciblyStopBroker(broker)
       }
       cluster.save()
 
-      def waitForBrokers(): Boolean = {
+      def waitForBrokers(): String = {
+        if (timeout.ms == 0) return "scheduled"
+
         for (broker <- brokers)
-          if (!broker.waitForState(start, timeout))
-            return false
-        true
+          if (!broker.waitFor(if (start) State.RUNNING else null, timeout))
+            return "timeout"
+
+        if (start) "started" else "stopped"
       }
-      val success = waitForBrokers()
+      val status = waitForBrokers()
 
       val result = new collection.mutable.LinkedHashMap[String, Any]()
-      result("success") = success
+      result("status") = status
       result("ids") = ids.mkString(",")
 
       response.getWriter.println(JSONObject(result.toMap))
     }
 
-    private def copyAndClose(in: InputStream, out: OutputStream): Unit = {
-      val buffer = new Array[Byte](16 * 1024)
-      var actuallyRead = 0
+    def handleRebalance(request: HttpServletRequest, response: HttpServletResponse): Unit = {
+      val cluster: Cluster = Scheduler.cluster
+      val rebalancer: Rebalancer = cluster.rebalancer
 
-      try {
-        while (actuallyRead != -1) {
-          actuallyRead = in.read(buffer)
-          if (actuallyRead != -1) out.write(buffer, 0, actuallyRead)
-        }
-      } finally {
-        try { in.close() }
-        catch { case ignore: IOException => }
+      val idExpr: String = request.getParameter("id")
+      var ids: util.List[String] = null
+      if (idExpr != null)
+        try { ids = cluster.expandIds(idExpr) }
+        catch { case e: IllegalArgumentException => response.sendError(400, "invalid id-expr"); return }
 
-        try { out.close() }
-        catch { case ignore: IOException => }
+      if (ids != null && rebalancer.running) { response.sendError(400, "rebalance is already running"); return }
+
+      val topicExpr = if (request.getParameter("topics") != null) request.getParameter("topics") else "*"
+      var topics: util.Map[String, Integer] = null
+      try { topics = rebalancer.expandTopics(topicExpr)}
+      catch { case e: IllegalArgumentException => response.sendError(400, "invalid topics"); return }
+      if (topics != null && topics.isEmpty) { response.sendError(400, "no topics specified"); return }
+
+      var timeout: Period = new Period("0")
+      if (request.getParameter("timeout") != null)
+        try { timeout = new Period(request.getParameter("timeout")) }
+        catch { case e: IllegalArgumentException => response.sendError(400, "invalid timeout"); return }
+
+
+      def startRebalance: (String, String) = {
+        try { rebalancer.start(ids, topics) }
+        catch { case e: Rebalancer.Exception => return ("failed", e.getMessage) }
+
+        if (timeout.ms > 0)
+          if (!rebalancer.waitFor(running = false, timeout)) return ("timeout", null)
+          else return ("completed", null)
+
+        ("started", null)
       }
+
+      var status: String = null
+      var error: String = null
+
+      if (ids != null) {
+        val result: (String, String) = startRebalance
+        status = result._1
+        error = result._2
+      } else
+        status = if (rebalancer.running) "running" else "idle"
+
+      val result = new collection.mutable.LinkedHashMap[String, Any]()
+      result("status") = status
+      if (error != null) result("error") = error
+      result("state") = rebalancer.state
+
+      response.getWriter.println(JSONObject(result.toMap))
     }
   }
 }

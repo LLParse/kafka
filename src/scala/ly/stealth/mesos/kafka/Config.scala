@@ -23,6 +23,9 @@ import java.net.URI
 
 object Config {
   var debug: Boolean = false
+  var clusterStorage: String = null
+
+  var frameworkId: String = null
   var mesosUser: String = null
 
   var masterConnect: String = null
@@ -34,7 +37,7 @@ object Config {
   def schedulerPort: Int = new URI(schedulerUrl).getPort
   load()
 
-  private def load(): Unit = {
+  private[kafka] def load(): Unit = {
     val configPath = System.getProperty("config")
     val file = new File(if (configPath != null) configPath else "kafka-mesos.properties")
     if (!file.exists()) throw new IllegalStateException("File " + file + " not found")
@@ -46,6 +49,9 @@ object Config {
     stream.close()
 
     debug = java.lang.Boolean.valueOf(props.getProperty("debug"))
+    clusterStorage = props.getProperty("clusterStorage", "file:kafka-mesos.json")
+
+    frameworkId = props.getProperty("framework.id")
     mesosUser = props.getProperty("mesos.user")
 
     masterConnect = props.getProperty("master.connect")

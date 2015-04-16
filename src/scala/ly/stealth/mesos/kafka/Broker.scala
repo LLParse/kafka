@@ -21,74 +21,119 @@ import java.util
 import scala.collection.JavaConversions._
 import scala.util.parsing.json.JSONObject
 import scala.collection
-import org.apache.mesos.Protos.Offer
-import java.util.regex.Pattern
-import java.util.{Date, UUID}
+import org.apache.mesos.Protos.{Resource, Offer}
+import java.util.{TimeZone, Collections, Date, UUID}
 import ly.stealth.mesos.kafka.Broker.Failover
+import Util.{Period, Str}
+import java.text.SimpleDateFormat
 
 class Broker(_id: String = "0") {
   var id: String = _id
   @volatile var active: Boolean = false
 
-  var host: String = null
-  var cpus: Double = 1
+  var cpus: Double = 0.5
   var mem: Long = 128
   var heap: Long = 128
 
-  var attributes: String = null
-  var options: String = null
+  var constraints: util.Map[String, Constraint] = new util.LinkedHashMap()
+  var options: util.Map[String, String] = new util.LinkedHashMap()
 
   var failover: Failover = new Failover()
 
-  def attributeMap: util.Map[String, String] = Broker.parseMap(attributes, ";", ":")
-  def optionMap: util.Map[String, String] = Broker.parseMap(options, ";", "=")
-
-  def effectiveOptionMap: util.Map[String, String] = {
-    val result = optionMap
-
-    for ((k, v) <- result) {
-      var nv = v
-      nv = nv.replace("$id", id)
-      if (host != null) nv = nv.replace("$host", host)
-
-      result.put(k, nv)
-    }
+  def options(defaults: util.Map[String, String] = null): util.Map[String, String] = {
+    val result = new util.LinkedHashMap[String, String]()
+    if (defaults != null) result.putAll(defaults)
+    
+    result.putAll(options)
+    for ((k, v) <- result)
+      result.put(k, v.replace("$id", id))
 
     result
   }
 
   @volatile var task: Broker.Task = null
 
-  def copy(): Broker = {
-    val broker: Broker = new Broker()
-    broker.id = id
-    broker.active = active
+  def matches(offer: Offer, otherAttributes: Broker.OtherAttributes = Broker.NoAttributes): Boolean = {
+    // check resources
+    val offerResources = new util.HashMap[String, Resource]()
+    for (resource <- offer.getResourcesList) offerResources.put(resource.getName, resource)
 
-    broker.host = host
-    broker.cpus = cpus
-    broker.mem = mem
-    broker.heap = heap
+    val cpusResource = offerResources.get("cpus")
+    if (cpusResource == null || cpusResource.getScalar.getValue < cpus) return false
 
-    broker.attributes = attributes
-    broker.options = options
+    val memResource = offerResources.get("mem")
+    if (memResource == null || memResource.getScalar.getValue < mem) return false
 
-    broker.failover = failover.copy
-    if (task != null) broker.task = task.copy
+    // check attributes
+    val offerAttributes = new util.HashMap[String, String]()
+    offerAttributes.put("hostname", offer.getHostname)
 
-    broker
+    for (attribute <- offer.getAttributesList)
+      if (attribute.hasText) offerAttributes.put(attribute.getName, attribute.getText.getValue)
+
+    for ((name, constraint) <- constraints) {
+      if (!offerAttributes.containsKey(name)) return false
+      if (!constraint.matches(offerAttributes.get(name), otherAttributes(name))) return false
+    }
+
+    true
+  }
+
+  def shouldStart(offer: Offer, otherAttributes: Broker.OtherAttributes = Broker.NoAttributes, now: Date = new Date()): Boolean = {
+    active && task == null && matches(offer, otherAttributes) && !failover.isWaitingDelay(now)
+  }
+
+  def shouldStop: Boolean = !active && task != null && !task.stopping
+  
+  def state(now: Date = new Date()): String = {
+    if (task != null && !task.starting) return task.state
+
+    if (active) {
+      if (failover.isWaitingDelay(now)) {
+        var s = "failed " + failover.failures
+        if (failover.maxTries != null) s += "/" + failover.maxTries
+        s += " " + Str.dateTime(failover.failureTime)
+        s += ", next start " + Str.dateTime(failover.delayExpires)
+        return s
+      }
+
+      if (failover.failures > 0) {
+        var s = "starting " + (failover.failures + 1)
+        if (failover.maxTries != null) s += "/" + failover.maxTries
+        s += ", failed " + Str.dateTime(failover.failureTime)
+        return s
+      }
+
+      return "starting"
+    }
+
+    "stopped"
+  }
+
+  def waitFor(state: String, timeout: Period): Boolean = {
+    def matches: Boolean = if (state != null) task != null && task.state == state else task == null
+
+    var t = timeout.ms
+    while (t > 0 && !matches) {
+      val delay = Math.min(100, t)
+      Thread.sleep(delay)
+      t -= delay
+    }
+
+    matches
   }
 
   def fromJson(node: Map[String, Object]): Unit = {
     id = node("id").asInstanceOf[String]
     active = node("active").asInstanceOf[Boolean]
 
-    if (node.contains("host")) host = node("host").asInstanceOf[String]
     cpus = node("cpus").asInstanceOf[Number].doubleValue()
     mem = node("mem").asInstanceOf[Number].longValue()
     heap = node("heap").asInstanceOf[Number].longValue()
 
-    if (node.contains("attributes")) attributes = node("attributes").asInstanceOf[String]
-    if (node.contains("options")) options = node("options").asInstanceOf[String]
+    if (node.contains("constraints")) constraints = Util.parseMap(node("constraints").asInstanceOf[String])
+                                                    .mapValues(new Constraint(_)).view.force
+    if (node.contains("options")) options = Util.parseMap(node("options").asInstanceOf[String])
 
     failover.fromJson(node("failover").asInstanceOf[Map[String, Object]])
 
@@ -103,187 +148,82 @@ class Broker(_id: String = "0") {
     obj("id") = id
     obj("active") = active
 
-    if (host != null) obj("host") = host
     obj("cpus") = cpus
     obj("mem") = mem
     obj("heap") = heap
 
-    if (attributes != null) obj("attributes") = attributes
-    if (options != null) obj("options") = options
+    if (!constraints.isEmpty) obj("constraints") = Util.formatMap(constraints)
+    if (!options.isEmpty) obj("options") = Util.formatMap(options)
 
     obj("failover") = failover.toJson
     if (task != null) obj("task") = task.toJson
 
     new JSONObject(obj.toMap)
   }
-
-  def matches(offer: Offer): Boolean = {
-    if (host != null && !Broker.matches(host, offer.getHostname)) return false
-
-    for (resource <- offer.getResourcesList) {
-      resource.getName match {
-        case "cpus" => if (resource.getScalar.getValue < cpus) return false
-        case "mem" => if (resource.getScalar.getValue < mem) return false
-        case "heap" => if (resource.getScalar.getValue < heap) return false
-        case _ => // ignore
-      }
-    }
-
-    val offerAttributes = new util.HashMap[String, String]()
-    for (attribute <- offer.getAttributesList) {
-      var value: String = null
-      if (attribute.hasText) value = attribute.getText.getValue
-      if (attribute.hasScalar) value = "" + attribute.getScalar.getValue
-
-      if (value != null) offerAttributes.put(attribute.getName, value)
-    }
-
-    for ((name, value) <- attributeMap) {
-      if (!offerAttributes.containsKey(name)) return false
-      if (!Broker.matches(value, offerAttributes.get(name))) return false
-    }
-
-    true
-  }
-
-  def waitForState(running: Boolean, timeout: java.lang.Long): Boolean = {
-    def stateMatches: Boolean = if (running) task != null && task.running else task == null
-
-    var t = timeout
-    while (t > 0 && !stateMatches) {
-      t -= 200
-      if (t > 0) Thread.sleep(200)
-    }
-
-    stateMatches
-  }
-
-  def state: String = {
-    if (active) {
-      if (task != null && task.running) return "running"
-
-      if (failover.isWaitingDelay) {
-        var s = "failed " + failover.failures
-        if (failover.maxTries != null) s += "/" + failover.maxTries
-        s += " " + MesosStr.dateTime(failover.failureTime)
-        s += ", next start " + MesosStr.dateTime(failover.delayExpires)
-        return s
-      }
-
-      if (failover.failures > 0) {
-        var s = "starting " + (failover.failures + 1)
-        if (failover.maxTries != null) s += "/" + failover.maxTries
-        s += ", failed " + MesosStr.dateTime(failover.failureTime)
-        return s
-      }
-
-      return "starting"
-    }
-
-    if (task != null) return "stopping"
-    "stopped"
-  }
 }
 
 object Broker {
   def nextTaskId(broker: Broker): String = "broker-" + broker.id + "-" + UUID.randomUUID()
   def nextExecutorId(broker: Broker): String = "broker-" + broker.id + "-" + UUID.randomUUID()
-  
+
   def idFromTaskId(taskId: String): String = {
     val parts: Array[String] = taskId.split("-")
     if (parts.length < 2) throw new IllegalArgumentException(taskId)
     parts(1)
   }
 
-  def matches(wildcard: String, value: String): Boolean = {
-    var regex: String = "^"
-    var token: String = ""
-    for (c <- wildcard.toCharArray) {
-      if (c == '*' || c == '?') {
-        regex += Pattern.quote(token)
-        token = ""
-        regex += (if (c == '*') ".*" else ".")
-      } else
-        token += c
-    }
-    if (token != "") regex += Pattern.quote(token)
-    regex += "$"
-
-    value.matches(regex)
-  }
-
-  def parseMap(s: String, entrySep: String, valueSep: String): util.LinkedHashMap[String, String] = {
-    val result = new util.LinkedHashMap[String, String]()
-    if (s == null) return result
-
-    for (entry <- s.split(entrySep))
-      if (entry.trim() != "") {
-        val pair = entry.split(valueSep)
-        if (pair.length == 2) result.put(pair(0).trim(), pair(1).trim())
-        else throw new IllegalArgumentException(s)
-      }
-
-    result
-  }
-
-  class Failover {
-    var delay: Period = new Period("10s")
-    var maxDelay: Period = new Period("60s")
+  class Failover(_delay: Period = new Period("10s"), _maxDelay: Period = new Period("60s")) {
+    var delay: Period = _delay
+    var maxDelay: Period = _maxDelay
     var maxTries: Integer = null
 
     @volatile var failures: Int = 0
     @volatile var failureTime: Date = null
 
     def currentDelay: Period = {
-      if (failures == 0) return new Period("0ms")
+      if (failures == 0) return new Period("0")
 
       val multiplier = 1 << (failures - 1)
-      val d = delay.toMs * multiplier
+      val d = delay.ms * multiplier
 
-      if (d > maxDelay.toMs) maxDelay else new Period(delay.getValue * multiplier + delay.getUnit)
+      if (d > maxDelay.ms) maxDelay else new Period(delay.value * multiplier + delay.unit)
     }
 
     def delayExpires: Date = {
       if (failures == 0) return new Date(0)
-      new Date(failureTime.getTime + currentDelay.toMs)
+      new Date(failureTime.getTime + currentDelay.ms)
     }
 
-    def isWaitingDelay: Boolean = delayExpires.getTime > System.currentTimeMillis()
+    def isWaitingDelay(now: Date = new Date()): Boolean = delayExpires.getTime > now.getTime
 
     def isMaxTriesExceeded: Boolean = {
       if (maxTries == null) return false
       failures >= maxTries
     }
 
-    def registerFailure(): Unit = {
+    def registerFailure(now: Date = new Date()): Unit = {
       failures += 1
-      failureTime = new Date()
+      failureTime = now
     }
 
     def resetFailures(): Unit = {
       failures = 0
       failureTime = null
     }
-    
-    def copy: Failover = {
-      val failover = new Failover()
 
-      failover.delay = delay
-      failover.maxDelay = maxDelay
-      failover.maxTries = maxTries
-
-      failover.failures = failures
-      failover.failureTime = failureTime
-      failover
+    def dateFormat: SimpleDateFormat = {
+      val format: SimpleDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS")
+      format.setTimeZone(TimeZone.getTimeZone("UTC-0"))
+      format
     }
 
     def fromJson(node: Map[String, Object]): Unit = {
       delay = new Period(node("delay").asInstanceOf[String])
       maxDelay = new Period(node("maxDelay").asInstanceOf[String])
       if (node.contains("maxTries")) maxTries = node("maxTries").asInstanceOf[Number].intValue()
-      
+
       if (node.contains("failures")) failures = node("failures").asInstanceOf[Number].intValue()
-      if (node.contains("failureTime")) failureTime = new Date(node("failureTime").asInstanceOf[Number].longValue())
+      if (node.contains("failureTime")) failureTime = dateFormat.parse(node("failureTime").asInstanceOf[String])
     }
 
     def toJson: JSONObject = {
@@ -294,47 +234,74 @@ object Broker {
       if (maxTries != null) obj("maxTries") = maxTries
 
       if (failures != 0) obj("failures") = failures
-      if (failureTime != null) obj("failureTime") = failureTime.getTime
-      
+      if (failureTime != null) obj("failureTime") = dateFormat.format(failureTime)
+
       new JSONObject(obj.toMap)
     }
   }
 
-  class Task(_id: String = null, _host: String = null, _port: Int = -1) {
+  class Task(
+    _id: String = null,
+    _slaveId: String = null,
+    _executorId: String = null,
+    _hostname: String = null,
+    _port: Int = -1,
+    _attributes: util.Map[String, String] = Collections.emptyMap(),
+    _state: String = State.STARTING
+  ) {
     var id: String = _id
-    @volatile var running: Boolean = false
-    var host: String = _host
+    var slaveId: String = _slaveId
+    var executorId: String = _executorId
+
+    var hostname: String = _hostname
     var port: Int = _port
+    var attributes: util.Map[String, String] = _attributes
 
-    def endpoint: String = host + ":" + port
+    @volatile var state: String = _state
+    def starting: Boolean = state == State.STARTING
+    def running: Boolean = state == State.RUNNING
+    def stopping: Boolean = state == State.STOPPING
+    def reconciling: Boolean = state == State.RECONCILING
 
-    def copy: Task = {
-      val task = new Task()
-
-      task.id = id
-      task.running = running
-      task.host = host
-      task.port = port
-
-      task
-    }
+    def endpoint: String = hostname + ":" + port
 
     def fromJson(node: Map[String, Object]): Unit = {
       id = node("id").asInstanceOf[String]
-      running = node("running").asInstanceOf[Boolean]
-      host = node("host").asInstanceOf[String]
+      slaveId = node("slaveId").asInstanceOf[String]
+      executorId = node("executorId").asInstanceOf[String]
+
+      hostname = node("hostname").asInstanceOf[String]
       port = node("port").asInstanceOf[Number].intValue()
+      attributes = node("attributes").asInstanceOf[Map[String, String]]
+
+      state = node("state").asInstanceOf[String]
     }
 
     def toJson: JSONObject = {
       val obj = new collection.mutable.LinkedHashMap[String, Any]()
 
       obj("id") = id
-      obj("running") = running
-      obj("host") = host
+      obj("slaveId") = slaveId
+      obj("executorId") = executorId
+
+      obj("hostname") = hostname
       obj("port") = port
+      obj("attributes") = new JSONObject(attributes.toMap)
+
+      obj("state") = state
 
       new JSONObject(obj.toMap)
     }
   }
+
+  object State {
+    val STOPPED = "stopped"
+    val STARTING = "starting"
+    val RUNNING = "running"
+    val RECONCILING = "reconciling"
+    val STOPPING = "stopping"
+  }
+
+  type OtherAttributes = (String) => Array[String]
+  def NoAttributes: OtherAttributes = _ => Array()
 }
