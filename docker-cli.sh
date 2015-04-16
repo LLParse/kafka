@@ -25,25 +25,25 @@ check_environment() {
 	# FAILOVER_TIMEOUT=36000
 
 	if [ ! -z "$DEBUG" ]; then
-		sed -r -i "s/(debug=).*/\1$DEBUG/g" kafka-mesos.properties
+		sed -r -i "s|(debug=).*|\1$DEBUG|g" kafka-mesos.properties
 	fi
 	if [ ! -z "$CLUSTER_STORAGE" ]; then
-		sed -r -i "s/(clusterStorage=).*/\1$CLUSTER_STORAGE/g" kafka-mesos.properties
+		sed -r -i "s|(clusterStorage=).*|\1$CLUSTER_STORAGE|g" kafka-mesos.properties
 	fi
 	if [ ! -z "$MESOS_USER" ]; then
-		sed -r -i "s/(mesos\.user=).*/\1$MESOS_USER/g" kafka-mesos.properties
+		sed -r -i "s|(mesos\.user=).*|\1$MESOS_USER|g" kafka-mesos.properties
 	fi
 	if [ ! -z "$MASTER_CONNECT" ]; then
-		sed -r -i "s/(master\.connect=).*/\1$MASTER_CONNECT/g" kafka-mesos.properties
+		sed -r -i "s|(master\.connect=).*|\1$MASTER_CONNECT|g" kafka-mesos.properties
 	fi
 	if [ ! -z "$ZK_CONNECT" ]; then
-		sed -r -i "s/(kafka\.zk\.connect=).*/\1$ZK_CONNECT/g" kafka-mesos.properties
+		sed -r -i "s|(kafka\.zk\.connect=).*|\1$ZK_CONNECT|g" kafka-mesos.properties
 	fi
 	if [ ! -z "$SCHEDULER_URL" ]; then
-		sed -r -i "s/(scheduler\.url=).*/\1$SCHEDULER_URL/g" kafka-mesos.properties
+		sed -r -i "s|(scheduler\.url=).*|\1$SCHEDULER_URL|g" kafka-mesos.properties
 	fi
 	if [ ! -z "$FAILOVER_TIMEOUT" ]; then
-		sed -r -i "s/(failoverTimeout=).*/\1$FAILOVER_TIMEOUT/g" kafka-mesos.properties
+		sed -r -i "s|(failoverTimeout=).*|\1$FAILOVER_TIMEOUT|g" kafka-mesos.properties
 	fi
 }
 
