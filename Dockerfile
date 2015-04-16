@@ -17,6 +17,7 @@ FROM ubuntu:14.04
 
 # Install Oracle JDK7
 RUN \
+  apt-get update && \
   apt-get install -y software-properties-common git curl && \
   add-apt-repository -y ppa:webupd8team/java && \
   echo oracle-java7-installer shared/accepted-oracle-license-v1-1 select true | debconf-set-selections && \
@@ -33,7 +34,6 @@ RUN \
   apt-get install -y mesos && \
   rm -rf /var/lib/apt/lists/*
 
-
 # Build the scheduler
 RUN \
   git clone https://github.com/mesos/kafka /opt/mesos-kafka && \
@@ -42,5 +42,7 @@ RUN \
   curl -O https://archive.apache.org/dist/kafka/0.8.2.1/kafka_2.10-0.8.2.1.tgz
 
 # Set wrapper script as entrypoint
+ADD docker-cli.sh /opt/mesos-kafka/docker-cli.sh
 WORKDIR /opt/mesos-kafka
-ENTRYPOINT ["./kafka-mesos.sh"]
+ENTRYPOINT ["./docker-cli.sh"]
+
