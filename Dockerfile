@@ -35,14 +35,14 @@ RUN \
   rm -rf /var/lib/apt/lists/*
 
 # Build the scheduler
+ENV KAFKA_VERSION 0.8.2.1
+ENV SCALA_VERSION 2.10
+ADD . /opt/mesos-kafka
+WORKDIR /opt/mesos-kafka
 RUN \
-  git clone https://github.com/mesos/kafka /opt/mesos-kafka && \
-  cd /opt/mesos-kafka && \
   ./gradlew jar && \
-  curl -O https://archive.apache.org/dist/kafka/0.8.2.1/kafka_2.10-0.8.2.1.tgz
+  curl -O https://archive.apache.org/dist/kafka/$KAFKA_VERSION/kafka_$SCALA_VERSION-$KAFKA_VERSION.tgz
 
 # Set wrapper script as entrypoint
-ADD docker-cli.sh /opt/mesos-kafka/docker-cli.sh
-WORKDIR /opt/mesos-kafka
 ENTRYPOINT ["./docker-cli.sh"]
 

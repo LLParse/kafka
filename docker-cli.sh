@@ -32,6 +32,10 @@ check_jar() {
 }
 
 check_environment() {
+    if [ ! -f "kafka_$SCALA_VERSION-$KAFKA_VERSION.tgz" ]; then
+        rm -rf kafka*.tgz
+        curl -O https://archive.apache.org/dist/kafka/$KAFKA_VERSION/kafka_$SCALA_VERSION-$KAFKA_VERSION.tgz
+    fi
 	if [ ! -z "$DEBUG" ]; then
 		sed -r -i "s|(debug=).*|\1$DEBUG|g" kafka-mesos.properties
 	fi
